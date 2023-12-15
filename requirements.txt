@@ -1,0 +1,7 @@
+speechrecognition
+pydub
+pyaudio
+openai-whisper
+torchaudio
+gruut
+tts

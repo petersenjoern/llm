@@ -1,8 +1,16 @@
+from tempfile import NamedTemporaryFile
+import time
 import click
 from click_default_group import DefaultGroup
 from dataclasses import asdict
 import io
 import json
+from TTS.api import TTS
+import speech_recognition as stt
+from pydub import AudioSegment
+from pydub.playback import play as play_audio_segment
+
+import torch
 from llm import (
     Collection,
     Conversation,
@@ -291,6 +299,31 @@ def prompt(
         migrate(db)
         response.log_to_db(db)
 
+def recognize(stt_engine, audio, whisper_model):
+    return stt_engine.recognize_whisper(audio, model=whisper_model)
+
+def say(tts_engine, text):
+    TTS_SPEECH_SPEED=2.0
+    audio_file = NamedTemporaryFile()
+
+    params = {
+        "emotion": "Happy",
+        "speed": TTS_SPEECH_SPEED,
+        "text": text,
+        "file_path": audio_file.name,
+    }
+
+    tts_done = False
+    while not tts_done:
+        try:
+            _ = tts_engine.tts_to_file(**params)
+            tts_done = True
+        except Exception as e:
+            print(e)
+            time.sleep(1) # because the loop doesn't respond to Ctrl-C otherwise
+
+    audio = AudioSegment.from_wav(audio_file.name)
+    play_audio_segment(audio)
 
 @cli.command()
 @click.option("-s", "--system", help="System prompt to use")
@@ -327,6 +360,7 @@ def prompt(
 )
 @click.option("--no-stream", is_flag=True, help="Do not stream output")
 @click.option("--key", help="API key to use")
+@click.option("--voice", is_flag=True, help="Chat by using your microphone")
 def chat(
     system,
     model_id,
@@ -337,6 +371,7 @@ def chat(
     options,
     no_stream,
     key,
+    voice
 ):
     """
     Hold an ongoing chat with a model.
@@ -406,40 +441,80 @@ def chat(
         validated_options["stream"] = False
 
     click.echo("Chatting with {}".format(model.model_id))
-    click.echo("Type 'exit' or 'quit' to exit")
-    click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
-    in_multi = False
-    accumulated = []
-    end_token = "!end"
-    while True:
-        prompt = click.prompt("", prompt_suffix="> " if not in_multi else "")
-        if prompt.strip().startswith("!multi"):
-            in_multi = True
-            bits = prompt.strip().split()
-            if len(bits) > 1:
-                end_token = "!end {}".format(" ".join(bits[1:]))
-            continue
-        if in_multi:
-            if prompt.strip() == end_token:
-                prompt = "\n".join(accumulated)
-                in_multi = False
-                accumulated = []
-            else:
-                accumulated.append(prompt)
+    
+    if voice:
+
+        TTS_MODEL_NAME="tts_models/en/jenny/jenny"
+        STT_ENERGY_THRESHOLD=2500
+        WHISPER_MODEL="medium.en"
+        LISTEN_SECONDS=5
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        tts_engine = TTS(TTS_MODEL_NAME).to(device)
+
+        stt_engine = stt.Recognizer()
+        stt_engine.energy_threshold = STT_ENERGY_THRESHOLD
+
+        #mic_device_index = get_microphone_device_id(stt.Microphone)
+        mic = stt.Microphone(device_index=None)
+        source = mic.__enter__()
+
+        
+        print("Initializing models and caching some data. Please wait, it could take a few minutes.")
+        say(tts_engine, "Hello, How can I help you today?")
+
+
+        while True:
+            audio = stt_engine.listen(source, timeout=LISTEN_SECONDS)
+            audio_user_response = recognize(stt_engine,audio,WHISPER_MODEL)
+            if len(audio_user_response) == 0:
                 continue
-        if template_obj:
-            try:
-                prompt, system = template_obj.evaluate(prompt, params)
-            except Template.MissingVariables as ex:
-                raise click.ClickException(str(ex))
-        if prompt.strip() in ("exit", "quit"):
-            break
-        response = conversation.prompt(prompt, system, **validated_options)
-        # System prompt only sent for the first message:
-        system = None
-        for chunk in response:
-            print(chunk, end="")
-            sys.stdout.flush()
+            print(audio_user_response)
+            response = conversation.prompt(audio_user_response, system, **validated_options)
+                        
+            # System prompt only sent for the first message:
+            system = None
+            for chunk in response:
+                print(chunk, end="")
+            response.log_to_db(db)
+            say(tts_engine, response.text())
+            print("")
+    
+        mic.__exit__(None, None, None)
+    else:
+        click.echo("Type 'exit' or 'quit' to exit")
+        click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
+        in_multi = False
+        accumulated = []
+        end_token = "!end"
+        while True:
+            prompt = click.prompt("", prompt_suffix="> " if not in_multi else "")
+            if prompt.strip().startswith("!multi"):
+                in_multi = True
+                bits = prompt.strip().split()
+                if len(bits) > 1:
+                    end_token = "!end {}".format(" ".join(bits[1:]))
+                continue
+            if in_multi:
+                if prompt.strip() == end_token:
+                    prompt = "\n".join(accumulated)
+                    in_multi = False
+                    accumulated = []
+                else:
+                    accumulated.append(prompt)
+                    continue
+            if template_obj:
+                try:
+                    prompt, system = template_obj.evaluate(prompt, params)
+                except Template.MissingVariables as ex:
+                    raise click.ClickException(str(ex))
+            if prompt.strip() in ("exit", "quit"):
+                break
+            response = conversation.prompt(prompt, system, **validated_options)
+            # System prompt only sent for the first message:
+            system = None
+            for chunk in response:
+                print(chunk, end="")
+            #sys.stdout.flush()
         response.log_to_db(db)
         print("")
 
@@ -1651,3 +1726,7 @@ def _human_readable_size(size_bytes):
 
 def logs_on():
     return not (user_dir() / "logs-off").exists()
+
+
+if __name__ == "__main__":
+    chat(system="You are a python expert", model_id="lite-o-wizard")
